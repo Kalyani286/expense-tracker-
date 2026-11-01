@@ -1,56 +1,106 @@
-"""SQLite-backed tool functions for the expense tracker agent."""
+"""SQLite- and PostgreSQL-backed tool functions for the expense tracker agent."""
 
 from __future__ import annotations
 
 import csv
 import io
 import os
-import sqlite3
 import urllib.parse
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
-
 from .categories import VALID_CATEGORIES, match_category
 
-DB_PATH = os.environ.get("EXPENSE_DB_PATH", "expenses.db")
-EXPORTS_DIR = os.environ.get("EXPENSE_EXPORTS_DIR", "exports")
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+DB_PATH      = os.environ.get("EXPENSE_DB_PATH", "expenses.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+EXPORTS_DIR  = os.environ.get("EXPENSE_EXPORTS_DIR", "exports")
 DEFAULT_CURRENCY = "EUR"
+_USE_PG = bool(DATABASE_URL)
 
 
 # ---------------------------------------------------------------------------
-# DB bootstrap
+# DB bootstrap & helpers
 # ---------------------------------------------------------------------------
 
-def _get_connection() -> sqlite3.Connection:
-    """Return a connection with both tables guaranteed to exist."""
+def _get_connection():
+    """Return a DB connection with both tables guaranteed to exist."""
+    if _USE_PG:
+        import psycopg2, psycopg2.extras
+        conn = psycopg2.connect(os.environ["DATABASE_URL"],
+                                cursor_factory=psycopg2.extras.RealDictCursor)
+        _bootstrap_pg(conn)
+        return conn
+    import sqlite3
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS expenses (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount      REAL    NOT NULL,
-            currency    TEXT    NOT NULL DEFAULT 'EUR',
-            category    TEXT    NOT NULL,
-            description TEXT    NOT NULL,
-            date        TEXT    NOT NULL
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'EUR', category TEXT NOT NULL,
+            description TEXT NOT NULL, date TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS recurring_expenses (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            category     TEXT    NOT NULL,
-            amount       REAL    NOT NULL,
-            currency     TEXT    NOT NULL DEFAULT 'EUR',
-            description  TEXT    NOT NULL,
-            day_of_month INTEGER NOT NULL DEFAULT 1,
-            active       INTEGER NOT NULL DEFAULT 1
-        );
+            id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL,
+            amount REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'EUR',
+            description TEXT NOT NULL, day_of_month INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1);
     """)
     conn.commit()
     return conn
+
+
+def _bootstrap_pg(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY, amount NUMERIC(12,2) NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'EUR', category TEXT NOT NULL,
+            description TEXT NOT NULL, date TEXT NOT NULL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS recurring_expenses (
+            id SERIAL PRIMARY KEY, category TEXT NOT NULL,
+            amount NUMERIC(12,2) NOT NULL, currency TEXT NOT NULL DEFAULT 'EUR',
+            description TEXT NOT NULL, day_of_month INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1)""")
+    conn.commit()
+
+
+def _fetchall(conn, sql: str, params=None) -> list[dict]:
+    if _USE_PG:
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params or ())
+            return [dict(r) for r in cur.fetchall()]
+    return [dict(r) for r in conn.execute(sql, params or ()).fetchall()]
+
+
+def _fetchone(conn, sql: str, params=None) -> dict | None:
+    if _USE_PG:
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params or ())
+            row = cur.fetchone()
+            return dict(row) if row else None
+    row = conn.execute(sql, params or ()).fetchone()
+    return dict(row) if row else None
+
+
+def _insert(conn, sql: str, params=None) -> int:
+    """Execute INSERT and return the new row id."""
+    if _USE_PG:
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s") + " RETURNING id", params or ())
+            return cur.fetchone()["id"]
+    cursor = conn.execute(sql, params or ())
+    return cursor.lastrowid
+
+
+def _run(conn, sql: str, params=None) -> None:
+    """Execute UPDATE or DELETE."""
+    if _USE_PG:
+        with conn.cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params or ())
+    else:
+        conn.execute(sql, params or ())
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +190,12 @@ def add_expense(
     currency = (currency or DEFAULT_CURRENCY).upper()
 
     conn = _get_connection()
-    cursor = conn.execute(
-        """INSERT INTO expenses (amount, currency, category, description, date)
-           VALUES (?, ?, ?, ?, ?)""",
+    expense_id = _insert(
+        conn,
+        "INSERT INTO expenses (amount, currency, category, description, date) VALUES (?, ?, ?, ?, ?)",
         (amount, currency, category, description.strip(), expense_date),
     )
     conn.commit()
-    expense_id = cursor.lastrowid
     conn.close()
 
     return {
@@ -187,14 +236,10 @@ def edit_expense(
         A dict with the updated expense details and a confirmation message.
     """
     conn = _get_connection()
-    row = conn.execute(
-        "SELECT * FROM expenses WHERE id = ?", (expense_id,)
-    ).fetchone()
-    if row is None:
+    current = _fetchone(conn, "SELECT * FROM expenses WHERE id = ?", (expense_id,))
+    if current is None:
         conn.close()
         return {"error": f"No expense found with id {expense_id}."}
-
-    current = dict(row)
 
     # Validate and apply updates
     if amount is not None:
@@ -229,7 +274,8 @@ def edit_expense(
     if currency is not None:
         current["currency"] = currency.upper()
 
-    conn.execute(
+    _run(
+        conn,
         """UPDATE expenses
            SET amount = ?, currency = ?, category = ?, description = ?, date = ?
            WHERE id = ?""",
@@ -271,15 +317,12 @@ def delete_expense(expense_id: int) -> dict:
         A confirmation message, or an error if the ID was not found.
     """
     conn = _get_connection()
-    row = conn.execute(
-        "SELECT * FROM expenses WHERE id = ?", (expense_id,)
-    ).fetchone()
-    if row is None:
+    expense = _fetchone(conn, "SELECT * FROM expenses WHERE id = ?", (expense_id,))
+    if expense is None:
         conn.close()
         return {"error": f"No expense found with id {expense_id}."}
 
-    expense = dict(row)
-    conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+    _run(conn, "DELETE FROM expenses WHERE id = ?", (expense_id,))
     conn.commit()
     conn.close()
 
@@ -332,10 +375,9 @@ def list_expenses(
     query += " ORDER BY date DESC, id DESC"
 
     conn = _get_connection()
-    rows = conn.execute(query, params).fetchall()
+    expenses = _fetchall(conn, query, params)
     conn.close()
 
-    expenses = [dict(r) for r in rows]
     total = round(sum(e["amount"] for e in expenses), 2)
 
     return {
@@ -433,7 +475,8 @@ def get_monthly_summary(year: int, month: int) -> dict:
 def _build_summary(start: str, end: str, label: str) -> dict:
     """Shared summary builder used by get_summary and get_monthly_summary."""
     conn = _get_connection()
-    rows = conn.execute(
+    breakdown = _fetchall(
+        conn,
         """SELECT category,
                   ROUND(SUM(amount), 2) AS total,
                   COUNT(*)              AS count
@@ -442,10 +485,9 @@ def _build_summary(start: str, end: str, label: str) -> dict:
            GROUP BY category
            ORDER BY total DESC""",
         (start, end),
-    ).fetchall()
+    )
     conn.close()
 
-    breakdown = [dict(r) for r in rows]
     grand_total = round(sum(r["total"] for r in breakdown), 2)
     top_category = breakdown[0]["category"] if breakdown else None
 
@@ -520,14 +562,15 @@ def set_recurring_expense(
     currency = (currency or DEFAULT_CURRENCY).upper()
 
     conn = _get_connection()
-    existing = conn.execute(
-        """SELECT id FROM recurring_expenses
-           WHERE category = ? AND description = ?""",
+    existing = _fetchone(
+        conn,
+        "SELECT id FROM recurring_expenses WHERE category = ? AND description = ?",
         (resolved, description.strip()),
-    ).fetchone()
+    )
 
     if existing:
-        conn.execute(
+        _run(
+            conn,
             """UPDATE recurring_expenses
                SET amount = ?, currency = ?, day_of_month = ?, active = 1
                WHERE id = ?""",
@@ -536,14 +579,14 @@ def set_recurring_expense(
         action = "Updated"
         record_id = existing["id"]
     else:
-        cursor = conn.execute(
+        record_id = _insert(
+            conn,
             """INSERT INTO recurring_expenses
                (category, amount, currency, description, day_of_month, active)
                VALUES (?, ?, ?, ?, ?, 1)""",
             (resolved, amount, currency, description.strip(), day_of_month),
         )
         action = "Created"
-        record_id = cursor.lastrowid
 
     conn.commit()
     conn.close()
@@ -570,13 +613,12 @@ def list_recurring_expenses() -> dict:
         A dict with the list of recurring templates and their details.
     """
     conn = _get_connection()
-    rows = conn.execute(
-        """SELECT * FROM recurring_expenses WHERE active = 1
-           ORDER BY category, description""",
-    ).fetchall()
+    templates = _fetchall(
+        conn,
+        "SELECT * FROM recurring_expenses WHERE active = 1 ORDER BY category, description",
+    )
     conn.close()
 
-    templates = [dict(r) for r in rows]
     return {
         "recurring_expenses": templates,
         "count": len(templates),
@@ -606,9 +648,7 @@ def apply_recurring_expenses(year: int, month: int) -> dict:
         return {"error": "month must be between 1 and 12."}
 
     conn = _get_connection()
-    templates = conn.execute(
-        "SELECT * FROM recurring_expenses WHERE active = 1"
-    ).fetchall()
+    templates = _fetchall(conn, "SELECT * FROM recurring_expenses WHERE active = 1")
 
     added = []
     skipped = []
@@ -618,24 +658,23 @@ def apply_recurring_expenses(year: int, month: int) -> dict:
         try:
             expense_date = date(year, month, t["day_of_month"]).isoformat()
         except ValueError:
-            # day_of_month > days in month — use last day
             last_day = (date(year, month + 1, 1) - timedelta(days=1)).day if month < 12 else 31
             expense_date = date(year, month, last_day).isoformat()
 
         # Idempotency check
-        exists = conn.execute(
-            """SELECT id FROM expenses
-               WHERE category = ? AND description = ? AND date = ?""",
+        exists = _fetchone(
+            conn,
+            "SELECT id FROM expenses WHERE category = ? AND description = ? AND date = ?",
             (t["category"], t["description"], expense_date),
-        ).fetchone()
+        )
 
         if exists:
             skipped.append(t["description"])
             continue
 
-        conn.execute(
-            """INSERT INTO expenses (amount, currency, category, description, date)
-               VALUES (?, ?, ?, ?, ?)""",
+        _insert(
+            conn,
+            "INSERT INTO expenses (amount, currency, category, description, date) VALUES (?, ?, ?, ?, ?)",
             (t["amount"], t["currency"], t["category"], t["description"], expense_date),
         )
         added.append({
@@ -672,11 +711,11 @@ def export_expenses(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> dict:
-    """Export expenses to an Excel (.xlsx) file for a given date range.
+    """Export expenses as CSV content for a given date range.
 
-    The file has 5 columns: Day, Date, Category, Item, Cost in euros.
-    It is saved to the exports/ directory and can be opened directly
-    in Excel or imported into Google Sheets.
+    The CSV has 6 columns: id, date, amount, currency, category, description.
+    The content is returned as a string so the agent can display it directly
+    in chat.
 
     Args:
         start_date: Start of range in YYYY-MM-DD format (inclusive).
@@ -685,7 +724,7 @@ def export_expenses(
             Defaults to today.
 
     Returns:
-        A dict with the file path, row count, and instructions to find the file.
+        A dict with csv_content, row_count, period, and a message.
     """
     today = date.today()
     if start_date is None:
@@ -694,76 +733,41 @@ def export_expenses(
         end_date = today.isoformat()
 
     conn = _get_connection()
-    rows = conn.execute(
-        """SELECT date, amount, currency, category, description
+    rows = _fetchall(
+        conn,
+        """SELECT id, date, amount, currency, category, description
            FROM expenses
            WHERE date BETWEEN ? AND ?
            ORDER BY date ASC, id ASC""",
         (start_date, end_date),
-    ).fetchall()
+    )
     conn.close()
 
     if not rows:
         return {
-            "message": f"No expenses found between {start_date} and {end_date}.",
-            "file_path": None,
+            "csv_content": "",
             "row_count": 0,
+            "period": f"{start_date} to {end_date}",
+            "message": f"No expenses found between {start_date} and {end_date}.",
         }
 
-    os.makedirs(EXPORTS_DIR, exist_ok=True)
-    filename = f"expenses_{start_date}_to_{end_date}.xlsx"
-    file_path = os.path.join(EXPORTS_DIR, filename)
-    abs_path = os.path.abspath(file_path)
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["id", "date", "amount", "currency", "category", "description"],
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    csv_content = buf.getvalue()
 
-    # Build workbook
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Expenses"
-
-    # Header style
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="2E75B6")
-    header_alignment = Alignment(horizontal="center")
-
-    headers = ["Day", "Date", "Category", "Item", "Cost in euros"]
-    col_widths = [12, 14, 20, 35, 16]
-
-    for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_alignment
-        ws.column_dimensions[cell.column_letter].width = width
-
-    # Data rows
-    for row in rows:
-        expense_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
-        day_name = expense_date.strftime("%A")          # e.g. Monday
-        date_fmt = expense_date.strftime("%d %b %Y")   # e.g. 01 Nov 2026
-        cost = row["amount"]
-
-        ws.append([day_name, date_fmt, row["category"], row["description"], cost])
-
-    # Format cost column as euros
-    for row_idx in range(2, ws.max_row + 1):
-        ws.cell(row=row_idx, column=5).number_format = '€#,##0.00'
-
-    # Freeze header row
-    ws.freeze_panes = "A2"
-
-    wb.save(file_path)
-
+    period = f"{start_date} to {end_date}"
     return {
-        "file_path": abs_path,
+        "csv_content": csv_content,
         "row_count": len(rows),
-        "period": f"{start_date} to {end_date}",
+        "period": period,
         "message": (
-            f"Your Excel file is ready with {len(rows)} expense(s) "
-            f"for {start_date} to {end_date}.\n\n"
-            f"📂 To find it on your Mac:\n"
-            f"1. Open Finder\n"
-            f"2. Press Cmd + Shift + G\n"
-            f"3. Paste this path: {abs_path}\n\n"
-            f"You can then open it in Excel or upload it to Google Sheets."
+            f"Here are your expenses for {period} ({len(rows)} rows). "
+            "Copy the CSV content below."
         ),
     }
