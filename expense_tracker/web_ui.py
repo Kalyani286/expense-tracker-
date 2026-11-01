@@ -203,18 +203,17 @@ def api_summary(start: str, end: str) -> JSONResponse:
 
 @app.get("/api/export")
 def api_export(start: str, end: str) -> FileResponse:
+    from .tools import _fetchall
     conn = _get_connection()
-    rows = conn.execute(
+    rows = _fetchall(conn,
         """SELECT date, amount, currency, category, description
            FROM expenses WHERE date BETWEEN ? AND ?
-           ORDER BY date ASC, id ASC""",
-        (start, end),
-    ).fetchall()
+           ORDER BY date ASC, id ASC""", (start, end))
     conn.close()
 
-    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    # Use /tmp so it works on any platform without a persistent disk
     filename = f"expenses_{start}_to_{end}.xlsx"
-    path = os.path.join(EXPORTS_DIR, filename)
+    path = os.path.join("/tmp", filename)
 
     wb = openpyxl.Workbook()
     ws = wb.active
