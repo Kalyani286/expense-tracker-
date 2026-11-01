@@ -40,7 +40,7 @@ if _APP_PASSWORD:
             auth = request.headers.get("Authorization", "")
             if auth.startswith("Basic "):
                 try:
-                    decoded = base64.b64decode(auth[7:]).decode()
+                    decoded = base64.b64decode(auth[6:]).decode()
                     _, pwd = decoded.split(":", 1)
                     if secrets.compare_digest(pwd.encode(), _APP_PASSWORD.encode()):
                         return await call_next(request)
