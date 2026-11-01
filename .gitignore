@@ -1,0 +1,21 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Database & personal data
+expenses.db
+exports/
+
+# ADK session data
+expense_tracker/.adk/
+
+# SSL certificates
+*.pem
+
+# macOS
+.DS_Store
