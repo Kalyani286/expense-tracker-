@@ -5,7 +5,6 @@ Run with:  uv run expense-web   (http://localhost:8080)
 
 from __future__ import annotations
 
-import base64
 import os
 import secrets
 from datetime import datetime
@@ -17,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()  # loads GOOGLE_API_KEY (and other vars) from .env before ADK initialises
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
@@ -30,28 +29,75 @@ from .tools import EXPORTS_DIR, _get_connection, _month_bounds
 app = FastAPI(title="Expense Tracker")
 
 # ---------------------------------------------------------------------------
-# Optional password protection — set APP_PASSWORD env var to enable
+# Cookie-based password protection — set APP_PASSWORD env var to enable
 # ---------------------------------------------------------------------------
 _APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+_SESSION_TOKEN = secrets.token_hex(32)  # regenerated on each server restart
 
 if _APP_PASSWORD:
-    class _BasicAuthMiddleware(BaseHTTPMiddleware):
+    class _AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            auth = request.headers.get("Authorization", "")
-            if auth.startswith("Basic "):
-                try:
-                    decoded = base64.b64decode(auth[6:]).decode()
-                    _, pwd = decoded.split(":", 1)
-                    if secrets.compare_digest(pwd.encode(), _APP_PASSWORD.encode()):
-                        return await call_next(request)
-                except Exception:
-                    pass
-            return Response(
-                status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Expense Tracker"'},
-            )
+            if request.url.path in ("/login", "/login/submit"):
+                return await call_next(request)
+            token = request.cookies.get("auth", "")
+            if token and secrets.compare_digest(token, _SESSION_TOKEN):
+                return await call_next(request)
+            return RedirectResponse(url="/login")
 
-    app.add_middleware(_BasicAuthMiddleware)
+    app.add_middleware(_AuthMiddleware)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(error: str = ""):
+    msg = '<p style="color:#e53e3e;margin-bottom:12px">Wrong password — try again.</p>' if error else ""
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Expense Tracker — Login</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #f0f4f8; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; margin: 0; }}
+    .box {{ background: #fff; border-radius: 18px; padding: 40px 36px;
+            box-shadow: 0 4px 24px rgba(0,0,0,.1); width: 100%; max-width: 360px; }}
+    h1 {{ font-size: 22px; font-weight: 800; color: #2E75B6; margin-bottom: 6px; }}
+    p.sub {{ font-size: 13px; color: #888; margin-bottom: 28px; }}
+    input {{ width: 100%; padding: 13px 16px; border: 1.5px solid #dde1e7;
+             border-radius: 12px; font-size: 15px; outline: none;
+             box-sizing: border-box; margin-bottom: 16px; }}
+    input:focus {{ border-color: #2E75B6; }}
+    button {{ width: 100%; padding: 14px; background: #2E75B6; color: #fff;
+              border: none; border-radius: 12px; font-size: 15px;
+              font-weight: 700; cursor: pointer; }}
+    button:hover {{ background: #2563a8; }}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>💰 Expense Tracker</h1>
+    <p class="sub">Enter your password to continue</p>
+    {msg}
+    <form method="post" action="/login/submit">
+      <input type="password" name="password" placeholder="Password" autofocus>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>""")
+
+
+@app.post("/login/submit")
+async def login_submit(request: Request):
+    form = await request.form()
+    pwd = form.get("password", "")
+    if _APP_PASSWORD and secrets.compare_digest(pwd.encode(), _APP_PASSWORD.encode()):
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie("auth", _SESSION_TOKEN, httponly=True, samesite="lax",
+                            max_age=60 * 60 * 24 * 30)  # 30 days
+        return response
+    return RedirectResponse(url="/login?error=1", status_code=302)
 
 # ---------------------------------------------------------------------------
 # ADK runner
