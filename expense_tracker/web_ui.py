@@ -171,33 +171,29 @@ async def api_chat(request: Request) -> JSONResponse:
 
 @app.get("/api/summary")
 def api_summary(start: str, end: str) -> JSONResponse:
+    from .tools import _fetchall
     conn = _get_connection()
 
-    expenses = conn.execute(
+    expenses  = _fetchall(conn,
         """SELECT id, date, amount, currency, category, description
            FROM expenses WHERE date BETWEEN ? AND ?
-           ORDER BY date DESC, id DESC""",
-        (start, end),
-    ).fetchall()
+           ORDER BY date DESC, id DESC""", (start, end))
 
-    breakdown = conn.execute(
+    breakdown = _fetchall(conn,
         """SELECT category, ROUND(SUM(amount), 2) AS total
            FROM expenses WHERE date BETWEEN ? AND ?
-           GROUP BY category ORDER BY total DESC""",
-        (start, end),
-    ).fetchall()
+           GROUP BY category ORDER BY total DESC""", (start, end))
 
     conn.close()
 
-    bl = [dict(r) for r in breakdown]
-    grand_total = round(sum(r["total"] for r in bl), 2)
+    grand_total = round(sum(r["total"] for r in breakdown), 2)
 
     return JSONResponse({
         "start": start, "end": end,
-        "expenses": [dict(r) for r in expenses],
-        "breakdown": bl,
+        "expenses": expenses,
+        "breakdown": breakdown,
         "grand_total": grand_total,
-        "top_category": bl[0]["category"] if bl else None,
+        "top_category": breakdown[0]["category"] if breakdown else None,
     })
 
 

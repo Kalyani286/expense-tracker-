@@ -7,6 +7,7 @@ import io
 import os
 import urllib.parse
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Optional
 
 from .categories import VALID_CATEGORIES, match_category
@@ -66,11 +67,16 @@ def _bootstrap_pg(conn) -> None:
     conn.commit()
 
 
+def _clean(row: dict) -> dict:
+    """Convert Decimal values (PostgreSQL NUMERIC) to float for JSON serialisation."""
+    return {k: float(v) if isinstance(v, Decimal) else v for k, v in row.items()}
+
+
 def _fetchall(conn, sql: str, params=None) -> list[dict]:
     if _USE_PG:
         with conn.cursor() as cur:
             cur.execute(sql.replace("?", "%s"), params or ())
-            return [dict(r) for r in cur.fetchall()]
+            return [_clean(dict(r)) for r in cur.fetchall()]
     return [dict(r) for r in conn.execute(sql, params or ()).fetchall()]
 
 
@@ -79,7 +85,7 @@ def _fetchone(conn, sql: str, params=None) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(sql.replace("?", "%s"), params or ())
             row = cur.fetchone()
-            return dict(row) if row else None
+            return _clean(dict(row)) if row else None
     row = conn.execute(sql, params or ()).fetchone()
     return dict(row) if row else None
 
